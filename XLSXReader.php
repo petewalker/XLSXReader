@@ -27,6 +27,8 @@ class XLSXReader {
 	protected $sheets = array();
 	protected $sharedstrings = array();
 	protected $sheetInfo;
+	public $dateFields = array();
+	public $is1904 = false;
 	protected $zip;
 	public $config = array(
 		'removeTrailingRows' => true
@@ -38,6 +40,7 @@ class XLSXReader {
 	const SCHEMA_OFFICEDOCUMENT_RELATIONSHIP = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 	const SCHEMA_SHAREDSTRINGS =  'http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings';
 	const SCHEMA_WORKSHEETRELATION =  'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet';
+	const SCHEMA_STYLE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles';
 
 	public function __construct($filePath, $config = array()) {
 		$this->config = array_merge($this->config, $config);
@@ -68,6 +71,9 @@ class XLSXReader {
 			if($rel['Type'] == self::SCHEMA_OFFICEDOCUMENT) {
 				$workbookDir = dirname($rel['Target']) . '/';
 				$workbookXML = simplexml_load_string($this->getEntryData($rel['Target']));
+				if (isset($workbookXML['date1904']) && $workbookXML['date1904'] == '1') {
+				    $this->is1904 = true;
+				}
 				foreach($workbookXML->sheets->sheet as $sheet) {				
 					$r = $sheet->attributes('r', true);
 					$sheets[(string)$r->id] = array(
@@ -92,6 +98,42 @@ class XLSXReader {
 								}
 							}
 							break;
+						case self::SCHEMA_STYLE:
+						    $styleXML = simplexml_load_string($this->getEntryData($workbookDir . (string)$wrel['Target']));
+						    $dates = array(
+                                14,
+                                15,
+                                16,
+                                17,
+                                18,
+                                19,
+                                20,
+                                21,
+                                22,
+                                45,
+                                46,
+                                47,
+                                48,
+                            );
+                            if (isset($styleXML->numFmts) && isset($styleXML->numFmts->numFmt)) {
+                                foreach($styleXML->numFmts->numFmt as $fmt) {				
+                                    if (preg_match('@^[0-9/\-\-\.\$dmyhs:\[\]\s]+$@', (string)$fmt['formatCode'])) {
+                                        $dates[] = intval((string)$fmt['numFmtId']);
+                                    }
+                                }
+                            }
+                                                        
+                            if (isset($styleXML->cellXfs) && isset($styleXML->cellXfs->xf)) {
+                                $i = 0;
+                                foreach ($styleXML->cellXfs->xf as $sty) {
+                                    if (in_array(intval((string)$sty['numFmtId']), $dates)) {
+                                        $this->dateFields[] = $i;
+                                    }
+                                    $i++;
+                                }
+                            }
+                                                        
+						    break;
 					}
 				}
 			}
@@ -134,7 +176,6 @@ class XLSXReader {
 		}
 		if(!array_key_exists($sheet, $this->sheets)) {
 			$this->sheets[$sheet] = new XLSXWorksheet($this->getSheetXML($sheet), $sheet, $this);
-
 		}
 		return $this->sheets[$sheet];
 	}
@@ -153,13 +194,17 @@ class XLSXReader {
 	}
 
 	// converts an Excel date field (a number) to a unix timestamp (granularity: seconds)
-	public static function toUnixTimeStamp($excelDateTime) {
+	public static function toUnixTimeStamp($excelDateTime, $is1904=false) {
 		if(!is_numeric($excelDateTime)) {
 			return $excelDateTime;
 		}
 		$d = floor($excelDateTime); // seconds since 1900
 		$t = $excelDateTime - $d;
-		return ($d > 0) ? ( $d - 25569 ) * 86400 + $t * 86400 : $t * 86400;
+		$diff = 25569;
+		if ($is1904) {
+		    $diff = 24107;
+		}
+		return ($d > 0) ? ((( $d - $diff ) * 86400) + ($t * 86400)) : ($t * 86400);
 	}
 
 }
@@ -291,6 +336,11 @@ class XLSXWorksheet {
 					return null;
 				}
 				$value = (string)$cell->v;
+				
+				// If this is an excel date, return a date string
+				if (is_numeric($value) && (string)$cell["s"] && in_array(intval((string)$cell["s"]), $this->workbook->dateFields)) {
+				    $value = date('Y-m-d', XLSXReader::toUnixTimeStamp($value, $this->workbook->is1904));
+				}
 
 				// Check for numeric values
 				if (is_numeric($value)) {
